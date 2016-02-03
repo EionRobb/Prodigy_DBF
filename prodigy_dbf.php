@@ -2,6 +2,7 @@
 class Prodigy_DBF {
     private $Filename, $DB_Type, $DB_Update, $DB_Records, $DB_FirstData, $DB_RecordLength, $DB_Flags, $DB_CodePageMark, $DB_Fields, $FileHandle, $FileOpened;
     private $Memo_Handle, $Memo_Opened, $Memo_BlockSize;
+	private $CurrentRowNumber;
 
     private function Initialize() {
 
@@ -28,6 +29,8 @@ class Prodigy_DBF {
         $this->Memo_Handle = NULL;
         $this->Memo_Opened = false;
         $this->Memo_BlockSize = NULL;
+		
+		$this->CurrentRowNumber = 0;
     }
 
     public function __construct($Filename, $MemoFilename = NULL) {
@@ -71,7 +74,8 @@ class Prodigy_DBF {
                     fseek($this->FileHandle, -1, SEEK_CUR);
                 }
 
-                $Field["Name"] = trim(fread($this->FileHandle, 11));
+				$FieldName = fread($this->FileHandle, 11);
+                $Field["Name"] = strtolower(substr($FieldName, 0, strpos($FieldName, "\0")));
                 $Field["Type"] = fread($this->FileHandle, 1);
                 fseek($this->FileHandle, 4, SEEK_CUR);  // Skipping attribute "displacement"
                 $Field["Size"] = ord(fread($this->FileHandle, 1));
@@ -100,40 +104,165 @@ class Prodigy_DBF {
 
         return $Return;
     }
+	
+	public function getFields() {
+        if(!$this->FileOpened) {
+			return false;
+		}
+		return $this->DB_Fields;
+	}
 
-    public function GetNextRecord($FieldCaptions = false) {
+    public function GetNextRecord($FieldCaptions = false, $ShowDeleted = false) {
         $Return = NULL;
         $Record = array();
-
+		$this->CurrentRowNumber++;
+		
         if(!$this->FileOpened) {
             $Return = false;
-        } elseif(feof($this->FileHandle)) {
+		} elseif($this->CurrentRowNumber > $this->DB_Records || feof($this->FileHandle)) {
             $Return = NULL;
         } else {
             // File open and not EOF
-            fseek($this->FileHandle, 1, SEEK_CUR);  // Ignoring DELETE flag
+			if (!$ShowDeleted) {
+				while(fread($this->FileHandle, 1) == '*') { // Deleted flag
+					fseek($this->FileHandle, $this->DB_RecordLength - 1, SEEK_CUR);
+					$this->CurrentRowNumber++;
+				}
+				if($this->CurrentRowNumber > $this->DB_Records || feof($this->FileHandle)) {
+					return NULL;
+				}
+			} else {
+				fseek($this->FileHandle, 1, SEEK_CUR);
+			}
             foreach($this->DB_Fields as $Field) {
                 $RawData = fread($this->FileHandle, $Field["Size"]);
                 // Checking for memo reference
-                if($Field["Type"] == "M" and $Field["Size"] == 4 and !empty($RawData)) {
-                    // Binary Memo reference
-                    $Memo_BO = unpack("V", $RawData);
-                    if($this->Memo_Opened and $Memo_BO != 0) {
-                        fseek($this->Memo_Handle, $Memo_BO[1] * $this->Memo_BlockSize);
-                        $Type = unpack("N", fread($this->Memo_Handle, 4));
-                        if($Type[1] == "1") {
-                            $Len = unpack("N", fread($this->Memo_Handle, 4));
-                            $Value = trim(fread($this->Memo_Handle, $Len[1]));
-                        } else {
-                            // Pictures will not be shown
-                            $Value = "{BINARY_PICTURE}";
-                        }
-                    } else {
-                        $Value = "{NO_MEMO_FILE_OPEN}";
-                    }
-                } else {
-                    $Value = trim($RawData);
-                }
+                if(($Field["Type"] == "M" or $Field["Type"] == "G" or $Field["Type"] == "P") and $Field["Size"] == 4) {
+					if (!empty($RawData)) {
+						// Memo, General, Picture
+						$Memo_BO = unpack("V", $RawData);
+						if($this->Memo_Opened and $Memo_BO[1] != 0) {
+							fseek($this->Memo_Handle, $Memo_BO[1] * $this->Memo_BlockSize);
+							$Type = unpack("N", fread($this->Memo_Handle, 4));
+							//if(true || $Type[1] == "1") {
+								$Len = unpack("N", fread($this->Memo_Handle, 4));
+								$Value = rtrim(fread($this->Memo_Handle, $Len[1]), ' ');
+							//} else {
+							//    // Pictures will not be shown
+							//    $Value = "{BINARY_PICTURE}";
+							//}
+						} else {
+							$Value = '';
+						}
+					} else {
+						$Value = '';
+					}
+                } else if ($Field["Type"] == 'V') {
+					// Varchar
+					$Len = ord(substr($RawData, -1));
+					$Value = substr($RawData, 0, $Len);
+                } else if ($Field["Type"] == 'C') {
+					// Char
+                    $Value = rtrim($RawData, ' ');
+                } else if ($Field["Type"] == 'L') {
+					// Logical (Boolean)
+					$Value = (!empty($RawData) && ($RawData{0} == 'Y' || $RawData{0} == 'T')) ? 1 : 0;
+                } else if ($Field["Type"] == 'Y') {
+					// Currency
+					
+					if (false /* speedhack */ && version_compare(PHP_VERSION, '5.6.3') >= 0) {
+						$Value = unpack('P', $RawData);
+						$Value = $Value[1] / 10000;
+					} else {
+						list($lo, $hi) = array_values(unpack('V2', $RawData));
+						
+						// 64-bit compatible PHP shortcut
+						if (false /* speedhack */ && PHP_INT_SIZE >= 8) {
+							if ($hi < 0) $hi += (1 << 32);
+							if ($lo < 0) $lo += (1 << 32);
+							$Value = (($hi << 32) + $lo) / 10000;
+						} else 
+						// No 64-bit magics	
+						if ($hi == 0) {
+							// No high-byte, no negative flag
+							if ($lo > 0) {
+								$Value = $lo / 10000;
+							} else {
+								$Value = bcdiv(sprintf("%u", $lo), 10000, 4);
+							}
+						} elseif ($hi == -1) {
+							// No high-byte, with negative flag
+							if ($lo < 0) {
+								$Value = $lo / 10000;
+							} else {
+								// sprintf is 10% faster than bcadd
+								$Value = bcdiv(sprintf("%.0f", $lo - 4294967296.0), 10000, 4);
+							}
+						} else {
+							$negativeSign = '';
+							$negativeOffset = 0;
+							if ($hi < 0)
+							{
+								$hi = ~$hi;
+								$lo = ~$lo;
+								$negativeOffset = 1;
+								$negativeSign = '-';
+							}	
+							$hi = sprintf("%u", $hi);
+							$lo = sprintf("%u", $lo);
+							
+							// 4294967296 = 2^32 = bcpow(2, 32)
+							$Value = bcdiv($negativeSign . bcadd(bcadd($lo, bcmul($hi, "4294967296")), $negativeOffset), 10000, 4);
+						}
+					}
+                } else if ($Field["Type"] == 'D') {
+					// Date
+					if ($RawData != '        ') {
+						$Value = substr($RawData, 0, 4) . '-' . substr($RawData, 4, 2) . '-' . substr($RawData, 6);
+					} else {
+						$Value = '1899-12-30';
+					}
+                } else if ($Field["Type"] == 'I') {
+					// Integer
+					if (!empty($RawData)) {
+						$Value = unpack('V', $RawData);
+						$Value = $Value[1];
+					} else {
+						$Value = 0;
+					}
+                } else if ($Field["Type"] == 'B') {
+					// Double
+					$Value = unpack('d', $RawData);
+					$Value = $Value[1];
+                } else if ($Field["Type"] == 'Q') {
+					// VarBinary
+					$Len = ord(substr($RawData, -1));
+					$Value = substr($RawData, 0, $Len);
+                } else if ($Field["Type"] == 'T') {
+					// DateTime (Timestamp)
+					if (!empty($RawData)) {
+						$Value = unpack('V2', $RawData);
+						$Date = jdtounix($Value[1]);
+						$Time = round($Value[2] / 1000);
+						if ($Date === false) {
+							$Value = '1899-12-30 ' . gmdate('H:i:s', $Time);
+						} else {
+							$Value = gmdate('Y-m-d H:i:s', $Date + $Time);
+						}
+					} else {
+						$Value = '1899-12-30 00:00:00';
+					}
+                } else if ($Field["Type"] == 'N' || $Field["Type"] == 'F' || $Field["Type"] == '+') {
+					// Numeric, Float, Autoincrement
+					$Value = (float) trim($RawData);
+                } else if ($Field["Type"] == '0') {
+					// System 'is nullable' column
+					continue;
+				} else {
+					// Unknown type?
+					//var_dump($Field); var_dump($RawData); die();
+					$Value = trim($RawData);
+				}
 
                 if($FieldCaptions) {
                     $Record[$Field["Name"]] = $Value;
